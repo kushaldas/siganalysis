@@ -131,47 +131,59 @@ for f in "$WORK"/cert_*.pem; do
 done
 
 # Identify the signer by matching issuer/serial from CMS SignerInfo
+# Also detect the digest algorithm used
 python3 - "$WORK" <<'PYEOF_SID'
 import sys, re, subprocess
 
 work = sys.argv[1]
-cms = open(f"{work}/sig0_cms.der", "rb").read()
 
-# Use openssl to dump the CMS and extract the signer's issuer and serial
 out = subprocess.check_output(
     ["openssl", "cms", "-inform", "DER", "-in", f"{work}/sig0_cms.der",
      "-cmsout", "-print", "-noout"], stderr=subprocess.STDOUT).decode(errors="replace")
 
-# Extract issuer serial from signerInfos -> issuerAndSerialNumber
-# Look for the serial number in the signerInfo section
-serial_match = re.search(r'issuerAndSerialNumber.*?serialNumber:\s*([0-9A-Fa-f: \n]+?)(?:\n\s*\w)', out, re.DOTALL)
+# The serialNumber line from openssl CMS dump is decimal
+serial_match = re.search(r'issuerAndSerialNumber.*?serialNumber:\s*(\d+)', out, re.DOTALL)
 if serial_match:
-    serial_hex = serial_match.group(1).strip().replace(":", "").replace(" ", "").replace("\n", "").lower()
-    # Convert to colon-separated uppercase for comparison
-    serial_int = int(serial_hex, 16)
-    print(f"SignerInfo serial (hex): {serial_hex}")
-    print(f"SignerInfo serial (int): {serial_int}")
-    open(f"{work}/signer_serial.txt", "w").write(str(serial_int))
+    serial_dec = serial_match.group(1).strip()
+    print(f"SignerInfo serial (dec): {serial_dec}")
+    open(f"{work}/signer_serial.txt", "w").write(serial_dec)
 else:
     print("WARNING: Could not extract signer serial from CMS")
     open(f"{work}/signer_serial.txt", "w").write("")
+
+# Detect digest algorithm from digestAlgorithms field
+digest_alg = "sha256"  # default fallback
+alg_match = re.search(r'digestAlgorithms:.*?algorithm:\s*(\S+)', out, re.DOTALL)
+if alg_match:
+    alg_name = alg_match.group(1).lower()
+    if "sha512" in alg_name:
+        digest_alg = "sha512"
+    elif "sha384" in alg_name:
+        digest_alg = "sha384"
+    elif "sha256" in alg_name:
+        digest_alg = "sha256"
+    elif "sha1" in alg_name:
+        digest_alg = "sha1"
+    print(f"Digest algorithm: {alg_name} -> {digest_alg}")
+open(f"{work}/digest_alg.txt", "w").write(digest_alg)
 PYEOF_SID
 
 SIGNER_SERIAL=$(cat "$WORK/signer_serial.txt")
+DIGEST_ALG=$(cat "$WORK/digest_alg.txt")
 
 SIGNER_CERT=""
 for f in "$WORK"/cert_*.pem; do
     subject=$(openssl x509 -in "$f" -noout -subject 2>/dev/null || true)
     issuer=$(openssl x509 -in "$f" -noout -issuer 2>/dev/null || true)
-    serial=$(openssl x509 -in "$f" -noout -serial 2>/dev/null | sed 's/serial=//' || true)
-    # Convert hex serial to decimal for comparison
-    serial_dec=$(python3 -c "print(int('$serial', 16))" 2>/dev/null || echo "")
+    serial_hex=$(openssl x509 -in "$f" -noout -serial 2>/dev/null | sed 's/serial=//' || true)
+    # Convert cert's hex serial to decimal for comparison with CMS decimal serial
+    serial_dec=$(python3 -c "print(int('$serial_hex', 16))" 2>/dev/null || echo "")
     if [ -n "$SIGNER_SERIAL" ] && [ "$serial_dec" = "$SIGNER_SERIAL" ]; then
         SIGNER_CERT="$f"
         echo "Signer certificate found (matched by serial number):"
         echo "  $subject"
         echo "  $issuer"
-        echo "  Serial: $serial"
+        echo "  Serial: $serial_hex (dec: $serial_dec)"
         openssl x509 -in "$f" -noout -text 2>/dev/null | \
             grep -E "Public-Key:|Signature Algorithm:" | head -4
         break
@@ -221,8 +233,9 @@ echo " Step 4: Verify messageDigest matches PDF content (Sig 0)"
 echo "========================================================================"
 echo
 
-COMPUTED_HASH=$(openssl dgst -sha256 -hex "$WORK/sig0_signed_data.bin" 2>/dev/null | awk '{print $NF}')
-echo "SHA-256 of signed byte ranges: $COMPUTED_HASH"
+COMPUTED_HASH=$(openssl dgst -"$DIGEST_ALG" -hex "$WORK/sig0_signed_data.bin" 2>/dev/null | awk '{print $NF}')
+echo "Digest algorithm:                $(echo "$DIGEST_ALG" | tr '[:lower:]' '[:upper:]')"
+echo "Hash of signed byte ranges:      $COMPUTED_HASH"
 
 MSG_DIGEST=$(openssl cms -inform DER -in "$WORK/sig0_cms.der" -cmsout -print -noout 2>&1 | \
     grep -A 10 "messageDigest" | grep -A 5 "OCTET STRING" | \
@@ -399,9 +412,9 @@ print(f"Signature algorithm: {oid_str} = {name}")
 PYEOF2
 
 echo
-echo "Verifying RSA signature over signed attributes with openssl:"
+echo "Verifying RSA signature over signed attributes with openssl ($DIGEST_ALG):"
 echo
-openssl dgst -sha256 \
+openssl dgst -"$DIGEST_ALG" \
     -verify "$WORK/signer_pubkey.pem" \
     -signature "$WORK/sig0_rsa_signature.bin" \
     "$WORK/sig0_signed_attrs.der" 2>&1 || true
@@ -416,13 +429,13 @@ echo
 
 # Determine messageDigest result
 if [ "$COMPUTED_HASH" = "$MSG_DIGEST" ]; then
-    DIGEST_RESULT="CORRECT (SHA-256 matches)"
+    DIGEST_RESULT="CORRECT ($(echo "$DIGEST_ALG" | tr '[:lower:]' '[:upper:]') matches)"
 else
     DIGEST_RESULT="MISMATCH"
 fi
 
 # Determine RSA verification result
-RSA_RESULT=$(openssl dgst -sha256 \
+RSA_RESULT=$(openssl dgst -"$DIGEST_ALG" \
     -verify "$WORK/signer_pubkey.pem" \
     -signature "$WORK/sig0_rsa_signature.bin" \
     "$WORK/sig0_signed_attrs.der" 2>&1 || true)
