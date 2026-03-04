@@ -8,15 +8,16 @@
 # verification oracle (independent of any Rust or Java implementation).
 #
 # Usage:
-#     ./diagnose_signature.sh [path/to/signed.pdf]
-#
-# Default PDF:
-#     ../underskrift/tests/fixtures/kushal_about-signed.pdf
+#     ./diagnose_signature.sh <path/to/signed.pdf>
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PDF="${1:-$SCRIPT_DIR/../underskrift/tests/fixtures/kushal_about-signed.pdf}"
+if [ -z "${1:-}" ]; then
+    echo "Usage: $0 <path/to/signed.pdf>" >&2
+    exit 1
+fi
+PDF="$1"
 
 if [ ! -f "$PDF" ]; then
     echo "ERROR: PDF not found: $PDF" >&2
